@@ -7,7 +7,9 @@ import (
 	"math/rand"
 	"net"
 	"net/smtp"
+	"net/textproto"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,48 +26,89 @@ type SMTP struct {
 	Disabled    bool `json:"disabled"`    // is the email blocked or disabled by the provider?
 }
 
+// catchAllOutcome records what the catch-all probe established. SMTP.CatchAll
+// cannot: it is also true when the probe never ran, and when the server replied
+// about itself rather than about the address.
+type catchAllOutcome int
+
+const (
+	// catchAllNotRun means the probe was disabled, or the exchange ended before it.
+	catchAllNotRun catchAllOutcome = iota
+	// catchAllAccepted means a random address was accepted, so the domain takes anything.
+	catchAllAccepted
+	// catchAllRefused means a random address was refused as non-existent, so the
+	// domain does not take just anything.
+	catchAllRefused
+	// catchAllInconclusive means the server replied, but about itself rather than
+	// about the address: a rate limit, a block, a temporary failure.
+	catchAllInconclusive
+)
+
+// catchAllFromResult reads an API verifier's flat result as a probe outcome.
+// The verifier reports a catch-all as a plain bool with none of our probing
+// behind it, so take it at face value: leaving the outcome at catchAllNotRun
+// would make a false CatchAll read as a refusal of the address itself.
+func catchAllFromResult(s *SMTP) catchAllOutcome {
+	if s != nil && s.CatchAll {
+		return catchAllAccepted
+	}
+	return catchAllRefused
+}
+
 // CheckSMTP performs an email verification on the passed domain via SMTP
 //   - the domain is the passed email domain
 //   - username is used to check the deliverability of specific email address,
 //
 // if server is catch-all server, username will not be checked
 func (v *Verifier) CheckSMTP(domain, username string) (*SMTP, error) {
+	res, _, err := v.checkSMTP(domain, username)
+	return res, err
+}
+
+// checkSMTP is CheckSMTP plus what the catch-all probe concluded. Verify needs
+// that to tell a domain which accepts every address from one we could not ask.
+func (v *Verifier) checkSMTP(domain, username string) (*SMTP, catchAllOutcome, error) {
 	if !v.smtpCheckEnabled {
-		return nil, nil
+		return nil, catchAllNotRun, nil
 	}
 
 	var ret SMTP
 	var err error
+	catchAll := catchAllNotRun
 	email := fmt.Sprintf("%s@%s", username, domain)
 
 	// Dial any SMTP server that will accept a connection
-	client, mx, err := newSMTPClient(domain, v.proxyURI, v.connectTimeout, v.operationTimeout)
+	client, mx, err := newSMTPClient(domain, v.proxyURI, v.dnsResolver(), v.connectTimeout, v.operationTimeout)
 	if err != nil {
-		return &ret, ParseSMTPError(err)
+		return &ret, catchAll, ParseSMTPError(err)
 	}
 
 	// Defer quit the SMTP connection
 	defer client.Close()
 
+	// We opened a connection and read the server's greeting, so the host is
+	// there whatever happens from here on. Recorded before EHLO and MAIL FROM
+	// so that a rejection at either -- which is about our sender, not about the
+	// host -- does not report the host as missing.
+	ret.HostExists = true
+
 	// Check by api when enabled and host recognized.
 	for _, apiVerifier := range v.apiVerifiers {
 		if apiVerifier.isSupported(strings.ToLower(mx.Host)) {
-			return apiVerifier.check(domain, username)
+			res, err := apiVerifier.check(domain, username)
+			return res, catchAllFromResult(res), err
 		}
 	}
 
 	// Sets the HELO/EHLO hostname
 	if err = client.Hello(v.helloName); err != nil {
-		return &ret, ParseSMTPError(err)
+		return &ret, catchAll, ParseSMTPError(err)
 	}
 
 	// Sets the from email
 	if err = client.Mail(v.fromEmail); err != nil {
-		return &ret, ParseSMTPError(err)
+		return &ret, catchAll, ParseSMTPError(err)
 	}
-
-	// Host exists if we've successfully formed a connection
-	ret.HostExists = true
 
 	// Default sets catch-all to true
 	ret.CatchAll = true
@@ -75,6 +118,9 @@ func (v *Verifier) CheckSMTP(domain, username string) (*SMTP, error) {
 		// order to verify the existence of a catch-all and etc.
 		randomEmail := GenerateRandomEmail(domain)
 		if err = client.Rcpt(randomEmail); err != nil {
+			// The server said something, but not necessarily about the address.
+			// Only a refusal of the address itself rules a catch-all out.
+			catchAll = catchAllInconclusive
 			if e := ParseSMTPError(err); e != nil {
 				switch e.Message {
 				case ErrFullInbox:
@@ -85,43 +131,49 @@ func (v *Verifier) CheckSMTP(domain, username string) (*SMTP, error) {
 				// In most cases, this is because the recipient address does not exist.
 				case ErrServerUnavailable:
 					ret.CatchAll = false
+					catchAll = catchAllRefused
 				default:
 
 				}
 
 			}
+		} else {
+			catchAll = catchAllAccepted
 		}
 
 		// If the email server is a catch-all email server,
 		// no need to calibrate deliverable on a specific user
 		if ret.CatchAll {
-			return &ret, nil
+			return &ret, catchAll, nil
 		}
 	}
 
 	// If no username provided,
 	// no need to calibrate deliverable on a specific user
 	if username == "" {
-		return &ret, nil
+		return &ret, catchAll, nil
 	}
 
 	if err = client.Rcpt(email); err == nil {
 		ret.Deliverable = true
 	}
 
-	return &ret, nil
+	return &ret, catchAll, nil
 }
 
 // newSMTPClient generates a new available SMTP client
-func newSMTPClient(domain, proxyURI string, connectTimeout, operationTimeout time.Duration) (*smtp.Client, *net.MX, error) {
+func newSMTPClient(domain, proxyURI string, resolver *net.Resolver, connectTimeout, operationTimeout time.Duration) (*smtp.Client, *net.MX, error) {
 	domain = domainToASCII(domain)
-	mxRecords, err := net.LookupMX(domain)
+	mxRecords, err := resolver.LookupMX(context.Background(), domain)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if len(mxRecords) == 0 {
-		return nil, nil, errors.New("No MX records found")
+		// Capitalised on purpose: ParseSMTPError passes this string through
+		// verbatim as LookupError.Message, which is user-facing and matches the
+		// Err* constants in error.go.
+		return nil, nil, errors.New("No MX records found") //nolint:staticcheck // ST1005
 	}
 	// Create a channel for receiving response from
 	ch := make(chan interface{}, 1)
@@ -138,7 +190,7 @@ func newSMTPClient(domain, proxyURI string, connectTimeout, operationTimeout tim
 		addr := r.Host + smtpPort
 		index := i
 		go func() {
-			c, err := dialSMTP(addr, proxyURI, connectTimeout, operationTimeout)
+			c, err := dialSMTP(addr, proxyURI, resolver, connectTimeout, operationTimeout)
 			if err != nil {
 				if !done {
 					ch <- err
@@ -170,19 +222,54 @@ func newSMTPClient(domain, proxyURI string, connectTimeout, operationTimeout tim
 		case error:
 			errs = append(errs, r)
 			if len(errs) == len(mxRecords) {
-				return nil, nil, errs[0]
+				return nil, nil, preferredDialError(errs)
 			}
 		default:
-			return nil, nil, errors.New("Unexpected response dialing SMTP server")
+			// Capitalised on purpose; see the note on "No MX records found" above.
+			return nil, nil, errors.New("Unexpected response dialing SMTP server") //nolint:staticcheck // ST1005
 		}
 	}
 
 }
 
+// preferredDialError picks the most useful of the errors gathered while racing
+// the MX hosts.
+//
+// The hosts are dialled concurrently, so the first error to arrive is the one
+// that failed fastest -- typically a refused connection or a DNS miss. An error
+// carrying an SMTP reply took longer precisely because a server answered and
+// said why it was refusing us, which is what the caller needs. Returning the
+// first arrival systematically preferred the least informative one.
+func preferredDialError(errs []error) error {
+	for _, err := range errs {
+		if hasSMTPReply(err) {
+			return err
+		}
+	}
+	return errs[0]
+}
+
+// hasSMTPReply reports whether err carries a reply from an SMTP server, as
+// opposed to a network level failure.
+func hasSMTPReply(err error) bool {
+	var protoErr *textproto.Error
+	if errors.As(err, &protoErr) {
+		return true
+	}
+	// Errors that have already been rendered to a string keep the reply code
+	// at the front, so fall back to reading it from there.
+	s := err.Error()
+	if len(s) < 3 {
+		return false
+	}
+	code, convErr := strconv.Atoi(s[:3])
+	return convErr == nil && code >= 200 && code < 600
+}
+
 // dialSMTP is a timeout wrapper for smtp.Dial. It attempts to dial an
 // SMTP server (socks5 proxy supported) and fails with a timeout if timeout is reached while
 // attempting to establish a new connection
-func dialSMTP(addr, proxyURI string, connectTimeout, operationTimeout time.Duration) (*smtp.Client, error) {
+func dialSMTP(addr, proxyURI string, resolver *net.Resolver, connectTimeout, operationTimeout time.Duration) (*smtp.Client, error) {
 	// Dial the new smtp connection
 	var conn net.Conn
 	var err error
@@ -190,7 +277,7 @@ func dialSMTP(addr, proxyURI string, connectTimeout, operationTimeout time.Durat
 	if proxyURI != "" {
 		conn, err = establishProxyConnection(addr, proxyURI, connectTimeout)
 	} else {
-		conn, err = establishConnection(addr, connectTimeout)
+		conn, err = establishConnection(addr, resolver, connectTimeout)
 	}
 	if err != nil {
 		return nil, err
@@ -210,7 +297,7 @@ func dialSMTP(addr, proxyURI string, connectTimeout, operationTimeout time.Durat
 // primarily for checking the existence of a catch-all address
 func GenerateRandomEmail(domain string) string {
 	r := make([]byte, 32)
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		r[i] = alphanumeric[rand.Intn(len(alphanumeric))] //nolint:gosec
 	}
 	return fmt.Sprintf("%s@%s", string(r), domain)
@@ -218,8 +305,9 @@ func GenerateRandomEmail(domain string) string {
 }
 
 // establishConnection connects to the address on the named network address.
-func establishConnection(addr string, timeout time.Duration) (net.Conn, error) {
-	return net.DialTimeout("tcp", addr, timeout)
+func establishConnection(addr string, resolver *net.Resolver, timeout time.Duration) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: timeout, Resolver: resolver}
+	return dialer.Dial("tcp", addr)
 }
 
 // establishProxyConnection connects to the address on the named network address
@@ -238,5 +326,37 @@ func establishProxyConnection(addr, proxyURI string, timeout time.Duration) (net
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	return dialer.(proxy.ContextDialer).DialContext(ctx, "tcp", addr)
+	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+		return contextDialer.DialContext(ctx, "tcp", addr)
+	}
+
+	// A dialer added with proxy.RegisterDialerType need not be a ContextDialer.
+	return dialWithTimeout(ctx, dialer, addr)
+}
+
+// dialWithTimeout dials through a Dialer that cannot take a context, abandoning
+// the attempt -- though not the goroutine -- when ctx is done, as x/net/proxy does.
+func dialWithTimeout(ctx context.Context, dialer proxy.Dialer, addr string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	done := make(chan result, 1)
+
+	go func() {
+		conn, err := dialer.Dial("tcp", addr)
+		done <- result{conn, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		go func() {
+			if r := <-done; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	case r := <-done:
+		return r.conn, r.err
+	}
 }

@@ -1,9 +1,11 @@
 package emailverifier
 
 import (
+	"net"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCheckEmailOK_SMTPHostNotExists(t *testing.T) {
@@ -26,11 +28,11 @@ func TestCheckEmailOK_SMTPHostNotExists(t *testing.T) {
 		HasMxRecords: false,
 		Disposable:   false,
 		RoleAccount:  false,
-		Reachable:    reachableUnknown,
+		Reachable:    reachableNo,
 		Free:         false,
 		SMTP:         nil,
 	}
-	assert.Error(t, err, ErrNoSuchHost)
+	require.ErrorContains(t, err, ErrNoSuchHost)
 	assert.Equal(t, &expected, ret)
 }
 
@@ -64,7 +66,7 @@ func TestCheckEmailOK_SMTPHostExists_NotCatchAll(t *testing.T) {
 			Disabled:    false,
 		},
 	}
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, &expected, ret)
 }
 
@@ -98,7 +100,7 @@ func TestCheckEmailOK_SMTPHostExists_FreeDomain(t *testing.T) {
 			Disabled:    false,
 		},
 	}
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, &expected, ret)
 }
 
@@ -126,7 +128,7 @@ func TestCheckEmail_ErrorSyntax(t *testing.T) {
 		Free:         false,
 		SMTP:         nil,
 	}
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, &expected, ret)
 }
 
@@ -134,9 +136,14 @@ func TestCheckEmail_Disposable(t *testing.T) {
 	var (
 		// trueVal  = true
 		username = "exampleuser"
-		domain   = "zzjbfwqi.shop"
-		address  = username + "@" + domain
-		email    = address
+		// Listed by six of the upstreams behind the disposable list and with
+		// no DNS records, which is what the rest of this expectation assumes.
+		// The previous fixture, zzjbfwqi.shop, was only in the list this repo
+		// used to build from, and passed after that change only because an
+		// earlier test left it in the package-level set.
+		domain  = "spambox.us"
+		address = username + "@" + domain
+		email   = address
 	)
 
 	ret, err := verifier.Verify(email)
@@ -154,7 +161,7 @@ func TestCheckEmail_Disposable(t *testing.T) {
 		Free:         false,
 		SMTP:         nil,
 	}
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, &expected, ret)
 }
 
@@ -182,7 +189,7 @@ func TestCheckEmail_Disposable_override(t *testing.T) {
 		Free:         false,
 		SMTP:         nil,
 	}
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, &expected, ret)
 }
 
@@ -216,7 +223,7 @@ func TestCheckEmail_RoleAccount(t *testing.T) {
 			Disabled:    false,
 		},
 	}
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, &expected, ret)
 }
 
@@ -246,7 +253,7 @@ func TestCheckEmail_DisabledSMTPCheck(t *testing.T) {
 		SMTP:         nil,
 	}
 	verifier.EnableSMTPCheck()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, &expected, ret)
 }
 
@@ -291,4 +298,92 @@ func TestCheckEmail_EnableDomainSuggest(t *testing.T) {
 	ret, _ := verifier.Verify(email)
 
 	assert.Empty(t, ret.Suggestion)
+}
+
+func TestCheckEmail_EnableDomainSuggest_Gmail(t *testing.T) {
+	var (
+		// trueVal  = true
+		username = "email_username"
+		domain   = "gmai.com"
+		address  = username + "@" + domain
+		email    = address
+	)
+
+	ret, _ := verifier.EnableDomainSuggest().Verify(email)
+
+	assert.Equal(t, "gmail.com", ret.Suggestion)
+}
+
+func TestNewVerifierOK_DefaultResolver(t *testing.T) {
+	v := NewVerifier()
+	assert.Nil(t, v.resolver)
+	assert.Same(t, net.DefaultResolver, v.dnsResolver())
+}
+
+func TestVerifier_Resolver(t *testing.T) {
+	customResolver := &net.Resolver{PreferGo: true}
+
+	v := NewVerifier().Resolver(customResolver)
+
+	assert.Same(t, customResolver, v.resolver)
+	assert.Same(t, customResolver, v.dnsResolver())
+}
+
+func TestVerifier_Resolver_NilRestoresDefault(t *testing.T) {
+	customResolver := &net.Resolver{PreferGo: true}
+
+	v := NewVerifier().Resolver(customResolver)
+	assert.Same(t, customResolver, v.dnsResolver())
+
+	v.Resolver(nil)
+
+	assert.Same(t, net.DefaultResolver, v.dnsResolver())
+}
+
+// net.DefaultResolver must be read at lookup time, not captured when the
+// Verifier is built. Callers who replace the global -- the only way to redirect
+// lookups before Resolver() existed -- would otherwise be silently ignored,
+// since NewVerifier is commonly called during package variable initialisation,
+// before any init() that installs the replacement.
+func TestVerifier_DefaultResolverReadAtCallTime(t *testing.T) {
+	original := net.DefaultResolver
+	t.Cleanup(func() { net.DefaultResolver = original })
+
+	v := NewVerifier()
+
+	replacement := &net.Resolver{PreferGo: true}
+	net.DefaultResolver = replacement
+
+	assert.Same(t, replacement, v.dnsResolver())
+}
+
+// The catch-all probe's outcome, not SMTP.CatchAll, decides whether an address
+// is unverifiable. CatchAll is also true when the probe never ran and when it
+// could not conclude, which used to turn a definite refusal into "unknown".
+func TestCalculateReachable(t *testing.T) {
+	v := NewVerifier().EnableSMTPCheck()
+
+	cases := []struct {
+		name     string
+		smtp     SMTP
+		catchAll catchAllOutcome
+		want     string
+	}{
+		{"address accepted", SMTP{HostExists: true, Deliverable: true}, catchAllRefused, reachableYes},
+		{"address refused, probe ruled a catch-all out", SMTP{HostExists: true}, catchAllRefused, reachableNo},
+		{"address refused, probe disabled", SMTP{HostExists: true, CatchAll: true}, catchAllNotRun, reachableNo},
+		{"address accepted, probe disabled", SMTP{HostExists: true, CatchAll: true, Deliverable: true}, catchAllNotRun, reachableYes},
+		{"probe established a catch-all domain", SMTP{HostExists: true, CatchAll: true}, catchAllAccepted, reachableUnknown},
+		{"probe inconclusive, address never reached", SMTP{HostExists: true, CatchAll: true}, catchAllInconclusive, reachableUnknown},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(tt *testing.T) {
+			assert.Equal(tt, c.want, v.calculateReachable(&c.smtp, c.catchAll))
+		})
+	}
+}
+
+func TestCalculateReachable_SMTPCheckDisabled(t *testing.T) {
+	assert.Equal(t, reachableUnknown, NewVerifier().calculateReachable(nil, catchAllNotRun))
 }

@@ -2,7 +2,7 @@ package emailverifier
 
 import (
 	"fmt"
-	"net/http"
+	"net"
 	"time"
 )
 
@@ -16,7 +16,8 @@ type Verifier struct {
 	helloName            string                     // email to use in the `MAIL FROM:` SMTP command. defaults to `localhost`
 	schedule             *schedule                  // schedule represents a job schedule
 	proxyURI             string                     // use a SOCKS5 proxy to verify the email,
-	apiVerifiers         map[string]smtpAPIVerifier // currently support gmail & yahoo, further contributions are welcomed.
+	apiVerifiers         map[string]smtpAPIVerifier // per-vendor API verifiers; no built-in vendors currently, contributions are welcomed.
+	resolver             *net.Resolver              // resolver used to perform MX and SMTP DNS lookups; nil means net.DefaultResolver, read at call time
 
 	// Timeouts
 	connectTimeout   time.Duration // Timeout for establishing connections
@@ -36,9 +37,6 @@ type Result struct {
 	Free         bool      `json:"free"`           // is domain a free email domain
 	HasMxRecords bool      `json:"has_mx_records"` // whether or not MX-Records for the domain
 }
-
-// additional list of disposable domains set via users of this library
-var additionalDisposableDomains map[string]bool = map[string]bool{}
 
 // init loads disposable_domain meta data to disposableSyncDomains which are safe for concurrent use
 func init() {
@@ -76,6 +74,9 @@ func (v *Verifier) Verify(email string) (*Result, error) {
 	ret.Free = v.IsFreeDomain(syntax.Domain)
 	ret.RoleAccount = v.IsRoleAccount(syntax.Username)
 	ret.Disposable = v.IsDisposable(syntax.Domain)
+	if v.domainSuggestEnabled {
+		ret.Suggestion = v.SuggestDomain(syntax.Domain)
+	}
 
 	// If the domain name is disposable, mx and smtp are not checked.
 	if ret.Disposable {
@@ -84,16 +85,26 @@ func (v *Verifier) Verify(email string) (*Result, error) {
 
 	mx, err := v.CheckMX(syntax.Domain)
 	if err != nil {
+		errStr := err.Error()
+		if insContains(errStr, "no such host") {
+			ret.Reachable = reachableNo
+			return &ret, newLookupError(ErrNoSuchHost, errStr).withCause(err)
+		}
 		return &ret, err
 	}
 	ret.HasMxRecords = mx.HasMXRecord
 
-	smtp, err := v.CheckSMTP(syntax.Domain, syntax.Username)
+	smtp, catchAll, err := v.checkSMTP(syntax.Domain, syntax.Username)
+
+	// Kept whether or not the check succeeded. A failed exchange still says how
+	// far it got, which is the difference between a host that never answered and
+	// one that answered and refused our sender.
+	ret.SMTP = smtp
+
 	if err != nil {
 		return &ret, err
 	}
-	ret.SMTP = smtp
-	ret.Reachable = v.calculateReachable(smtp)
+	ret.Reachable = v.calculateReachable(smtp, catchAll)
 
 	if v.gravatarCheckEnabled {
 		gravatar, err := v.CheckGravatar(email)
@@ -103,17 +114,13 @@ func (v *Verifier) Verify(email string) (*Result, error) {
 		ret.Gravatar = gravatar
 	}
 
-	if v.domainSuggestEnabled {
-		ret.Suggestion = v.SuggestDomain(syntax.Domain)
-	}
-
 	return &ret, nil
 }
 
 // AddDisposableDomains adds additional domains as disposable domains.
 func (v *Verifier) AddDisposableDomains(domains []string) *Verifier {
 	for _, d := range domains {
-		additionalDisposableDomains[d] = true
+		additionalDisposableDomains.Store(d, struct{}{})
 		disposableSyncDomains.Store(d, struct{}{})
 	}
 	return v
@@ -140,17 +147,16 @@ func (v *Verifier) EnableSMTPCheck() *Verifier {
 	return v
 }
 
-// EnableAPIVerifier API verifier is activated when EnableAPIVerifier for the target vendor.
+// EnableAPIVerifier activates an API-based existence check for the given vendor.
 // ** Please know ** that this is a tricky way (but relatively stable) to check if target vendor's email exists.
 // If you use this feature in a production environment, please ensure that you have sufficient backup measures in place, as this may encounter rate limiting or other API issues.
+//
+// There are currently no built-in vendors: the Yahoo verifier was removed once its
+// endpoint stopped existing (see https://github.com/AfterShip/email-verifier/issues/195),
+// following the same fate as the Gmail verifier removed in #113. This remains an
+// extension point; contributions adding a working vendor are welcome.
 func (v *Verifier) EnableAPIVerifier(name string) error {
-	switch name {
-	case YAHOO:
-		v.apiVerifiers[YAHOO] = newYahooAPIVerifier(http.DefaultClient)
-	default:
-		return fmt.Errorf("unsupported to enable the API verifier for vendor: %s", name)
-	}
-	return nil
+	return fmt.Errorf("unsupported to enable the API verifier for vendor: %s", name)
 }
 
 func (v *Verifier) DisableAPIVerifier(name string) {
@@ -163,9 +169,8 @@ func (v *Verifier) DisableSMTPCheck() *Verifier {
 	return v
 }
 
-// EnableCatchAllCheck enables catchAll check by smtp
-// for most ISPs block outgoing catchAll requests through port 25, to prevent spam,
-// we don't check catchAll by default
+// EnableCatchAllCheck enables the catchAll check by smtp. It is on by default;
+// this undoes a previous DisableCatchAllCheck.
 func (v *Verifier) EnableCatchAllCheck() *Verifier {
 	v.catchAllCheckEnabled = true
 	return v
@@ -220,11 +225,41 @@ func (v *Verifier) HelloName(domain string) *Verifier {
 }
 
 // Proxy sets a SOCKS5 proxy to verify the email,
-// proxyURI should be in the format: "socks5://user:password@127.0.0.1:1080?timeout=5s".
-// The protocol could be socks5, socks4 and socks4a.
+// proxyURI should be in the format: "socks5://user:password@127.0.0.1:1080".
+//
+// The scheme must be socks5 or socks5h -- the only two golang.org/x/net/proxy
+// resolves. Anything else, socks4 and socks4a included, fails the dial with
+// "proxy: unknown scheme"; add it with proxy.RegisterDialerType.
+//
+// Only the scheme, credentials and host are read; a query string is ignored, so
+// a "?timeout=5s" has no effect. Use ConnectTimeout and OperationTimeout.
+//
+// The proxy carries the connection to the mail server, not DNS: MX lookups
+// still go out from the local machine. See Resolver for routing those through
+// the proxy too.
 func (v *Verifier) Proxy(proxyURI string) *Verifier {
 	v.proxyURI = proxyURI
 	return v
+}
+
+// Resolver sets a custom DNS resolver to use for MX and SMTP host lookups,
+// allowing users to configure custom DNS servers instead of relying on the
+// system's default resolver (e.g. /etc/resolv.conf). Passing nil restores
+// the default resolver (net.DefaultResolver).
+func (v *Verifier) Resolver(resolver *net.Resolver) *Verifier {
+	v.resolver = resolver
+	return v
+}
+
+// dnsResolver returns the resolver to use for lookups. net.DefaultResolver is
+// read here rather than captured in NewVerifier so that callers who replace the
+// global keep the behaviour they had before this option existed -- the previous
+// code called net.LookupMX, which reads net.DefaultResolver on every call.
+func (v *Verifier) dnsResolver() *net.Resolver {
+	if v.resolver == nil {
+		return net.DefaultResolver
+	}
+	return v.resolver
 }
 
 // ConnectTimeout sets the timeout for establishing connections.
@@ -239,14 +274,22 @@ func (v *Verifier) OperationTimeout(timeout time.Duration) *Verifier {
 	return v
 }
 
-func (v *Verifier) calculateReachable(s *SMTP) string {
+// calculateReachable turns the SMTP observations into a verdict. Callers reach
+// it only from Verify, which always has a username: a syntactically valid
+// address cannot have an empty local part, so the address itself was always
+// probed unless the catch-all probe returned first.
+func (v *Verifier) calculateReachable(s *SMTP, catchAll catchAllOutcome) string {
 	if !v.smtpCheckEnabled {
 		return reachableUnknown
 	}
 	if s.Deliverable {
 		return reachableYes
 	}
-	if s.CatchAll {
+	// Deliberately not s.CatchAll, which is also true when the probe never ran
+	// or could not conclude. Only a probe that established a catch-all domain,
+	// or one that returned before the address was probed, leaves the address
+	// unverifiable; otherwise the address was refused and that is a definite no.
+	if catchAll == catchAllAccepted || catchAll == catchAllInconclusive {
 		return reachableUnknown
 	}
 	return reachableNo

@@ -13,12 +13,12 @@ import (
 func updateDisposableDomains(source string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequest("GET", source, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
 		return err
 	}
 
-	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -61,9 +61,18 @@ func updateDisposableDomains(source string) error {
 		disposableSyncDomains.Store(d, struct{}{})
 	}
 
-	// add additionalDisposableDomains again
-	for d := range additionalDisposableDomains {
-		disposableSyncDomains.Store(d, struct{}{})
+	// The generated list has the domains in disposable_allowlist.txt removed
+	// already; take them out of what was just fetched too, or the first
+	// refresh reinstates every one of them.
+	for d := range allowedDisposableDomains {
+		disposableSyncDomains.Delete(d)
 	}
+
+	// add additionalDisposableDomains again -- after the allowlist, so a
+	// caller who explicitly adds one of those domains still gets it back
+	additionalDisposableDomains.Range(func(key, _ interface{}) bool {
+		disposableSyncDomains.Store(key, struct{}{})
+		return true
+	})
 	return nil
 }
